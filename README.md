@@ -18,7 +18,7 @@ Enterprise backup system implementing Shamir's Secret Sharing for enhanced secur
 - Python 3.7+
 - Required Python packages:
   ```bash
-  pip install pycryptodome pyyaml boto3 azure-storage-blob azure-keyvault-secrets azure-identity pymongo redis psycopg2 pymssql mysql-connector-python
+  pip install pycryptodome pyyaml boto3 azure-storage-blob azure-keyvault-secrets azure-identity pymongo redis psycopg2 pymssql mysql-connector-python mssql-scripter
   ```
 - System tools: `glab`, `tar`, `pg_dump`, `mysqldump`, `mongodump` (depending on what you're backing up)
 
@@ -43,9 +43,21 @@ encryption:
     - type: local_disk
       path: /secure/share2
       description: "Backup server 2"
+    - type: email
+      name: "John Doe"
+      address: "john.doe@example.com"
+      description: "CTO - Shareholder 3"
     - type: vault
       url: https://vault.company.com
       path: /secret/backup-shares
+
+# Optional: SMTP configuration for email shares
+smtp:
+  host: smtp.gmail.com
+  port: 587
+  username_env: SMTP_USERNAME
+  password_env: SMTP_PASSWORD
+  use_tls: true
 ```
 
 See `config.yaml` for full configuration options.
@@ -109,7 +121,38 @@ Shares are distributed to multiple locations to prevent single point of compromi
 - **AWS Secrets Manager**: Cloud-based secret storage
 - **Azure Key Vault**: Azure cloud secret storage
 - **Local Disk**: Encrypted disks or secure file systems
+- **Email**: Send shares to stakeholders with detailed backup report
 - **Offline**: Physical storage (printed QR codes, USB drives in safes)
+
+#### Email Share Configuration
+
+Email shares send the key share with a comprehensive backup report including:
+- Backup date and checksum
+- List of backed up databases (RDS and external)
+- List of GitLab repositories
+- Storage location
+- Threshold requirements
+
+Configure SMTP in `config.yaml`:
+```yaml
+smtp:
+  host: smtp.gmail.com
+  port: 587
+  username_env: SMTP_USERNAME
+  password_env: SMTP_PASSWORD
+  use_tls: true
+```
+
+Or use environment variables:
+```bash
+export SMTP_HOST="smtp.gmail.com"
+export SMTP_PORT="587"
+export SMTP_USERNAME="your-email@gmail.com"
+export SMTP_PASSWORD="your-app-password"
+export SMTP_USE_TLS="true"
+```
+
+Email template can be customized in `email_template.txt`.
 
 ### Threat Model
 
@@ -202,6 +245,46 @@ Logs are written to both console and file:
 - Location: `./log/dr-backup-{date}.log`
 - Level: Configurable via `config.yaml` (DEBUG, INFO, WARNING, ERROR)
 
+## Storage Configuration
+
+### S3-Compatible Storage (including Alibaba Cloud OSS)
+
+The script uses boto3 which is compatible with any S3-compatible storage, including:
+- Amazon S3
+- **Alibaba Cloud OSS** (fully compatible)
+- MinIO
+- Wasabi
+- DigitalOcean Spaces
+
+For Alibaba Cloud OSS:
+```yaml
+storage:
+  primary:
+    type: s3
+    endpoint: https://oss-me-central-1.aliyuncs.com  # Your region endpoint
+    bucket: your-bucket-name
+    access_key_env: ALIBABA_ACCESS_KEY
+    secret_key_env: ALIBABA_SECRET_KEY
+```
+
+### Storage vs Local Backup Path
+
+- **`backup_source_base_path`**: Source data directory to be backed up
+- **`backup_target_base_path`**: Local temporary directory where encrypted backup is created
+- **`storage.primary`**: Remote/permanent storage for long-term backup retention (optional)
+- **`storage.secondary`**: Secondary remote storage for redundancy (optional)
+
+The script will work without `storage` configured - backups remain in `backup_target_base_path`.
+
+### Optional Configuration Sections
+
+All sections are optional and gracefully skipped if not configured:
+- `gitlab`: Skip if not configured
+- `databases.rds_instances`: Skip if not configured
+- `databases.external_databases`: Skip if not configured
+- `storage.primary`: Skip upload if not configured
+- `storage.secondary`: Skip if not configured
+
 ## Troubleshooting
 
 **Issue**: "RuntimeError: dictionary changed size during iteration"
@@ -215,6 +298,9 @@ Logs are written to both console and file:
 
 **Issue**: Cannot find shares during recovery
 - **Fix**: Check share locations in config. Shares are stored with naming: `share_{date}_{index}.json`
+
+**Issue**: Script fails with missing config sections
+- **Fix**: Already fixed. All optional sections (gitlab, databases, storage) are now failsafe.
 
 ## License
 

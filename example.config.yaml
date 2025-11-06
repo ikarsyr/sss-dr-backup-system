@@ -69,6 +69,10 @@ encryption:
       description: "Physical safe - Office A"
     - type: offline
       description: "Safety deposit box - Bank B"
+    - type: email
+      name: "John Doe"
+      address: "john.doe@example.com"
+      description: "CTO - Shareholder 3"
 
 storage:
   primary:

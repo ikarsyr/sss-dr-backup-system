@@ -64,6 +64,10 @@ class DRBackupSystem:
 
     def setup_logging(self):
         """Setup logging configuration"""
+        # Create log directory if it doesn't exist
+        log_dir = Path('./log')
+        log_dir.mkdir(parents=True, exist_ok=True)
+
         logging.basicConfig(
             level=getattr(logging, self.config['general']['log_level']),
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -81,8 +85,8 @@ class DRBackupSystem:
         #     sys.exit(1)
 
         # Check required tools
-        # required_tools = ['glab', 'pg_dump', 'mysqldump', 'mongodump', 'tar', 'gpg']
-        required_tools = ['glab']
+        required_tools = ['glab', 'pg_dump', 'mysqldump', 'mongodump', 'tar', 'gpg']
+        # required_tools = ['glab']
         for tool in required_tools:
             if subprocess.run(['which', tool], capture_output=True).returncode != 0:
                 self.logger.error(f"Required tool not found: {tool}")
@@ -100,6 +104,11 @@ class DRBackupSystem:
 
     def backup_gitlab(self):
         """Backup all GitLab repositories"""
+        # Check if GitLab is configured
+        if 'gitlab' not in self.config or 'group' not in self.config['gitlab']:
+            self.logger.info("No GitLab configuration found, skipping...")
+            return
+
         self.logger.info("Starting GitLab backup...")
 
         os.chdir(self.backup_path / 'git')
@@ -190,16 +199,48 @@ class DRBackupSystem:
             env = os.environ.copy()
             env['PGPASSWORD'] = password
 
-            cmd = [
-                'pg_dumpall',
-                '-h', host,
-                '-p', port or '5432',
-                '-U', username,
-                '-f', str(backup_file),
-                '--clean',
-                '--if-exists'
-            ]
-            subprocess.run(cmd, env=env, check=True)
+            # Get list of databases to backup
+            databases = instance.get('databases', [])
+
+            if databases and databases != 'all':
+                # Dump each database individually
+                total_dbs = len(databases)
+                for idx, db_name in enumerate(databases, 1):
+                    self.logger.info(f"  Dumping database: {db_name} [{instance['id']}: {idx}/{total_dbs}]")
+                    db_backup_file = self.backup_path / 'db' / f"{instance['id']}_{db_name}.sql"
+
+                    cmd = [
+                        'pg_dump',
+                        '-h', host,
+                        '-p', port or '5432',
+                        '-U', username,
+                        '-d', db_name,
+                        '-f', str(db_backup_file),
+                        '--clean',
+                        '--if-exists'
+                    ]
+                    subprocess.run(cmd, env=env, check=True)
+
+                    # Compress individual backup
+                    subprocess.run(['gzip', '-9', str(db_backup_file)], check=True)
+
+                # Return the first one for compatibility
+                backup_file = self.backup_path / 'db' / f"{instance['id']}_{databases[0]}.sql.gz"
+            else:
+                # Use pg_dumpall only if 'all' is specified
+                cmd = [
+                    'pg_dumpall',
+                    '-h', host,
+                    '-p', port or '5432',
+                    '-U', username,
+                    '-f', str(backup_file),
+                    '--clean',
+                    '--if-exists'
+                ]
+                subprocess.run(cmd, env=env, check=True)
+                # Compress the backup
+                subprocess.run(['gzip', '-9', str(backup_file)], check=True)
+                backup_file = f"{backup_file}.gz"
 
         elif engine == 'mysql':
             cmd = [
@@ -216,11 +257,14 @@ class DRBackupSystem:
                 '--result-file', str(backup_file)
             ]
             subprocess.run(cmd, check=True)
+            # Compress the backup
+            subprocess.run(['gzip', '-9', str(backup_file)], check=True)
+            backup_file = f"{backup_file}.gz"
 
         elif engine == 'mssql':
             # Use mssql-scripter for schema and data
             cmd = [
-                'mssql-scripter',
+                'python3', '-m', 'mssql_scripter',
                 '-S', endpoint,
                 '-U', username,
                 '-P', password,
@@ -228,14 +272,19 @@ class DRBackupSystem:
                 '-f', str(backup_file)
             ]
             subprocess.run(cmd, check=True)
+            # Compress the backup
+            subprocess.run(['gzip', '-9', str(backup_file)], check=True)
+            backup_file = f"{backup_file}.gz"
 
-        # Compress the backup
-        subprocess.run(['gzip', '-9', str(backup_file)], check=True)
-
-        return f"{backup_file}.gz"
+        return str(backup_file)
 
     def backup_external_databases(self):
         """Backup external database services"""
+        # Check if external_databases is configured
+        if 'databases' not in self.config or 'external_databases' not in self.config['databases']:
+            self.logger.info("No external databases configured, skipping...")
+            return
+
         self.logger.info("Backing up external databases...")
 
         for db in self.config['databases']['external_databases']:
@@ -368,6 +417,8 @@ class DRBackupSystem:
                 self.store_share_azure(location, share_data)
             elif location['type'] == 'local_disk':
                 self.store_share_local_disk(location, share_data)
+            elif location['type'] == 'email':
+                self.store_share_email(location, share_data)
             elif location['type'] == 'offline':
                 self.store_share_offline(location, share_data)
 
@@ -431,6 +482,152 @@ class DRBackupSystem:
         if 'description' in location:
             self.logger.info(f"  Location: {location['description']}")
 
+    def store_share_email(self, location: Dict, share_data: Dict):
+        """Send share via email with backup details"""
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.application import MIMEApplication
+
+        self.logger.info(f"Preparing email share for {location['name']} ({location['address']})")
+
+        # Create share JSON file in temp location
+        share_file = self.temp_workspace / f"share_{self.backup_date}_{share_data['share_index']}.json"
+        with open(share_file, 'w') as f:
+            json.dump(share_data, f, indent=2)
+
+        # Load email template
+        template_path = Path(__file__).parent / 'email_template.txt'
+        with open(template_path, 'r') as f:
+            template = f.read()
+
+        # Collect backup information
+        backup_info = self._collect_backup_info()
+
+        # Format RDS instances
+        rds_text = ""
+        if backup_info['rds_instances']:
+            rds_text = "-- RDS Databases:\n"
+            for instance in backup_info['rds_instances']:
+                rds_text += f"   - {instance['id']}: {', '.join(instance['databases'])}\n"
+
+        # Format external databases
+        external_text = ""
+        if backup_info['external_databases']:
+            external_text = "-- External Databases:\n"
+            for db in backup_info['external_databases']:
+                db_list = ', '.join(db['databases']) if db['databases'] else 'all'
+                external_text += f"   - {db['id']} ({db['type']}): {db_list}\n"
+
+        # Format GitLab repositories
+        gitlab_text = ""
+        if backup_info['gitlab_repos']:
+            gitlab_text = "-- GitLab Repositories:\n"
+            for repo in backup_info['gitlab_repos']:
+                gitlab_text += f"   - {repo}\n"
+
+        # Get storage location
+        storage_location = "Local: " + str(self.temp_workspace)
+        if 'storage' in self.config and 'primary' in self.config['storage']:
+            storage_location = f"{self.config['storage']['primary']['endpoint']}/{self.config['storage']['primary']['bucket']}/{self.backup_date}/"
+
+        # Fill template
+        email_body = template.format(
+            name=location['name'],
+            backup_date=self.backup_date,
+            rds_instances=rds_text,
+            external_databases=external_text,
+            gitlab_repos=gitlab_text,
+            checksum=backup_info.get('checksum', 'Pending'),
+            storage_location=storage_location,
+            threshold=self.config['encryption']['threshold']
+        )
+
+        # Create email
+        msg = MIMEMultipart()
+        msg['From'] = self.config['general'].get('notification_email', 'backup@company.com')
+        msg['To'] = location['address']
+        msg['Subject'] = f"Backup Key Share - {self.backup_date}"
+
+        # Attach body
+        msg.attach(MIMEText(email_body, 'plain'))
+
+        # Attach share file
+        with open(share_file, 'rb') as f:
+            attachment = MIMEApplication(f.read(), _subtype='json')
+            attachment.add_header('Content-Disposition', 'attachment',
+                                filename=f"share_{self.backup_date}_{share_data['share_index']}.json")
+            msg.attach(attachment)
+
+        # Send email (using SMTP configuration from environment or config)
+        smtp_config = self._get_smtp_config()
+        if smtp_config:
+            try:
+                with smtplib.SMTP(smtp_config['host'], smtp_config['port']) as server:
+                    if smtp_config.get('use_tls', True):
+                        server.starttls()
+                    if smtp_config.get('username') and smtp_config.get('password'):
+                        server.login(smtp_config['username'], smtp_config['password'])
+                    server.send_message(msg)
+                    self.logger.info(f"Sent share {share_data['share_index']} to {location['address']}")
+            except Exception as e:
+                self.logger.error(f"Failed to send email to {location['address']}: {e}")
+                self.logger.info(f"Share file saved locally: {share_file}")
+        else:
+            self.logger.warning("No SMTP configuration found. Email not sent.")
+            self.logger.info(f"Share file saved locally for manual sending: {share_file}")
+
+    def _collect_backup_info(self) -> Dict:
+        """Collect information about what was backed up"""
+        info = {
+            'rds_instances': [],
+            'external_databases': [],
+            'gitlab_repos': []
+        }
+
+        # Collect RDS instances
+        if 'databases' in self.config and 'rds_instances' in self.config['databases']:
+            for instance in self.config['databases']['rds_instances']:
+                info['rds_instances'].append({
+                    'id': instance['id'],
+                    'databases': instance.get('databases', [])
+                })
+
+        # Collect external databases
+        if 'databases' in self.config and 'external_databases' in self.config['databases']:
+            for db in self.config['databases']['external_databases']:
+                info['external_databases'].append({
+                    'id': db['id'],
+                    'type': db['type'],
+                    'databases': db.get('databases', [])
+                })
+
+        # Collect GitLab repos from backup directory
+        git_path = self.backup_path / 'git'
+        if git_path.exists():
+            info['gitlab_repos'] = [d.name for d in git_path.iterdir() if d.is_dir()]
+
+        return info
+
+    def _get_smtp_config(self) -> Dict:
+        """Get SMTP configuration from config or environment"""
+        # Check if SMTP is configured in config file
+        if 'smtp' in self.config:
+            return self.config['smtp']
+
+        # Try to get from environment variables
+        smtp_host = os.environ.get('SMTP_HOST')
+        if smtp_host:
+            return {
+                'host': smtp_host,
+                'port': int(os.environ.get('SMTP_PORT', 587)),
+                'username': os.environ.get('SMTP_USERNAME'),
+                'password': os.environ.get('SMTP_PASSWORD'),
+                'use_tls': os.environ.get('SMTP_USE_TLS', 'true').lower() == 'true'
+            }
+
+        return None
+
     def store_share_offline(self, location: Dict, share_data: Dict):
         """Generate offline share for physical storage"""
         offline_file = self.temp_workspace / f"offline_share_{share_data['share_index']}.txt"
@@ -467,9 +664,14 @@ class DRBackupSystem:
 
     def upload_to_storage(self, encrypted_file: str, checksum: str):
         """Upload to write-only storage"""
+        # Check if storage is configured
+        if 'storage' not in self.config or 'primary' not in self.config['storage']:
+            self.logger.info("No storage configured, skipping upload...")
+            return
+
         self.logger.info("Uploading to secure storage...")
 
-        # Upload to primary storage (MinIO)
+        # Upload to primary storage
         s3_client = boto3.client(
             's3',
             endpoint_url=self.config['storage']['primary']['endpoint'],
@@ -491,7 +693,7 @@ class DRBackupSystem:
             }
         )
 
-        # Upload to secondary storage (Azure)
+        # Upload to secondary storage (Azure) if configured
         if 'secondary' in self.config['storage']:
             blob_service = BlobServiceClient(
                 account_url=f"https://{self.config['storage']['secondary']['account_name']}.blob.core.windows.net",
@@ -527,31 +729,31 @@ class DRBackupSystem:
             if not self.check_prerequisites():
                 sys.exit(1)
 
-            # # 2. Create directory structure
-            # self.create_backup_structure()
+            # 2. Create directory structure
+            self.create_backup_structure()
 
             # # 3. Backup GitLab repositories
             # self.backup_gitlab()
 
-            # # 4. Backup all databases
-            # with ThreadPoolExecutor(max_workers=5) as executor:
-            #     # Create backup users first
-            #     for instance in self.config['databases']['rds_instances']:
-            #         # Setup backup user logic here
-            #         pass
+            # 4. Backup all databases
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                # Create backup users first
+                for instance in self.config['databases']['rds_instances']:
+                    # Setup backup user logic here
+                    pass
 
-            #     # Backup RDS instances
-            #     futures = []
-            #     for instance in self.config['databases']['rds_instances']:
-            #         future = executor.submit(self.backup_rds_instance, instance)
-            #         futures.append(future)
+                # Backup RDS instances
+                futures = []
+                for instance in self.config['databases']['rds_instances']:
+                    future = executor.submit(self.backup_rds_instance, instance)
+                    futures.append(future)
 
-            #     # Wait for all backups to complete
-            #     for future in futures:
-            #         future.result()
+                # Wait for all backups to complete
+                for future in futures:
+                    future.result()
 
-            # # 5. Backup external databases
-            # self.backup_external_databases()
+            # 5. Backup external databases
+            self.backup_external_databases()
 
             # 6. Create archive
             archive_path = self.archive_backup()

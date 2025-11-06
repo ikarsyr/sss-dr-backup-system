@@ -1,0 +1,19 @@
+Hi {name},
+
+This is an automated notification about recent backup of the DB and Code completion.
+
+Details:
+- Date: {backup_date}
+- Contents:
+{rds_instances}
+{external_databases}
+{gitlab_repos}
+- Checksum: {checksum}
+- Location: {storage_location}
+
+Your decryption key share is attached to this email.
+
+You will need at least {threshold} shares from share-holders to decrypt this backup file. Remember, backup for each day uses different key shares.
+
+Best regards,
+Disaster Recovery Backup System
