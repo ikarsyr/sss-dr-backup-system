@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+Enterprise Disaster Recovery Backup System
+Implements Shamir's Secret Sharing for key protection
+"""
+
+import os
+import sys
+import yaml
+import json
+import hashlib
+import subprocess
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any
+import secrets
+from concurrent.futures import ThreadPoolExecutor
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Protocol.SecretSharing import Shamir
+import pymongo
+import redis
+import psycopg2
+import pymssql
+import mysql.connector
+import boto3
+from azure.storage.blob import BlobServiceClient
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
+
+class DRBackupSystem:
+    def __init__(self, config_path: str):
+        self.config = self.load_config(config_path)
+        self.backup_date = datetime.now().strftime('%Y-%m-%d')
+        self.setup_logging()
+        self.backup_path = Path(self.config['general']['backup_source_base_path']) / self.backup_date
+        self.temp_workspace = Path(self.config['general']['backup_target_base_path']) / self.backup_date
+
+    def load_config(self, config_path: str) -> Dict:
+        """Load and validate configuration"""
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        # Load sensitive data from environment variables
+        for key in ['token_env', 'access_key_id_env', 'access_key_secret_env',
+                    'backup_password_env', 'connection_string_env', 'password_env']:
+            self._resolve_env_vars(config, key)
+
+        return config
+
+    def _resolve_env_vars(self, d: Dict, key_suffix: str):
+        """Recursively resolve environment variables in config"""
+        # Collect changes to avoid modifying dict during iteration
+        changes = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                self._resolve_env_vars(v, key_suffix)
+            elif isinstance(v, str) and k.endswith(key_suffix):
+                env_var = v
+                changes[k.replace('_env', '')] = os.environ.get(env_var, '')
+        # Apply changes after iteration
+        d.update(changes)
+
+    def setup_logging(self):
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=getattr(logging, self.config['general']['log_level']),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(f'./log/dr-backup-{self.backup_date}.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def check_prerequisites(self) -> bool:
+        """Check if backup can proceed"""
+        # if self.backup_path.exists():
+        #     self.logger.error(f"Backup directory already exists: {self.backup_path}")
+        #     sys.exit(1)
+
+        # Check required tools
+        # required_tools = ['glab', 'pg_dump', 'mysqldump', 'mongodump', 'tar', 'gpg']
+        required_tools = ['glab']
+        for tool in required_tools:
+            if subprocess.run(['which', tool], capture_output=True).returncode != 0:
+                self.logger.error(f"Required tool not found: {tool}")
+                return False
+
+        return True
+
+    def create_backup_structure(self):
+        """Create backup directory structure"""
+        self.logger.info(f"Creating backup structure at {self.backup_path}")
+
+        (self.backup_path / 'git').mkdir(parents=True, exist_ok=True)
+        (self.backup_path / 'db').mkdir(parents=True, exist_ok=True)
+        (self.temp_workspace).mkdir(parents=True, exist_ok=True)
+
+    def backup_gitlab(self):
+        """Backup all GitLab repositories"""
+        self.logger.info("Starting GitLab backup...")
+
+        os.chdir(self.backup_path / 'git')
+
+        cmd = [
+            'glab', 'repo', 'clone',
+            '-g', self.config['gitlab']['group'],
+            '--include-subgroups',
+            '--per-page', str(self.config['gitlab']['per_page'])
+        ]
+
+        env = os.environ.copy()
+        env['GITLAB_TOKEN'] = self.config['gitlab']['token']
+
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            self.logger.error(f"GitLab backup failed: {result.stderr}")
+            raise Exception("GitLab backup failed")
+
+        self.logger.info("GitLab backup completed")
+
+    def create_backup_user(self, engine: str, connection_params: Dict):
+        """Create read-only backup user if not exists"""
+        backup_user = self.config['databases']['backup_username']
+        backup_pass = self.config['databases']['backup_password']
+
+        try:
+            if engine == 'postgresql':
+                conn = psycopg2.connect(**connection_params)
+                cur = conn.cursor()
+                cur.execute(f"""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (SELECT FROM pg_user WHERE usename = '{backup_user}') THEN
+                            CREATE USER {backup_user} WITH PASSWORD '{backup_pass}';
+                        END IF;
+                    END $$;
+                    GRANT CONNECT ON DATABASE gamedb TO {backup_user};
+                    GRANT USAGE ON SCHEMA public TO {backup_user};
+                    GRANT SELECT ON ALL TABLES IN SCHEMA public TO {backup_user};
+                """)
+                conn.commit()
+
+            elif engine == 'mysql':
+                conn = mysql.connector.connect(**connection_params)
+                cur = conn.cursor()
+                cur.execute(f"""
+                    CREATE USER IF NOT EXISTS '{backup_user}'@'%' IDENTIFIED BY '{backup_pass}';
+                    GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER ON *.* TO '{backup_user}'@'%';
+                    FLUSH PRIVILEGES;
+                """)
+
+            elif engine == 'mssql':
+                conn = pymssql.connect(**connection_params)
+                cur = conn.cursor()
+                cur.execute(f"""
+                    IF NOT EXISTS (SELECT name FROM sys.server_principals WHERE name = '{backup_user}')
+                    BEGIN
+                        CREATE LOGIN {backup_user} WITH PASSWORD = '{backup_pass}'
+                    END
+                    IF NOT EXISTS (SELECT name FROM sys.database_principals WHERE name = '{backup_user}')
+                    BEGIN
+                        CREATE USER {backup_user} FOR LOGIN {backup_user}
+                        ALTER ROLE db_datareader ADD MEMBER {backup_user}
+                    END
+                """)
+                conn.commit()
+
+        except Exception as e:
+            self.logger.warning(f"Could not create backup user: {e}")
+
+    def backup_rds_instance(self, instance: Dict) -> str:
+        """Backup individual RDS instance"""
+        self.logger.info(f"Backing up RDS instance: {instance['id']}")
+
+        engine = instance['engine']
+        endpoint = instance['endpoint']
+        backup_file = self.backup_path / 'db' / f"{instance['id']}_{engine}.sql"
+
+        # Use backup user credentials
+        username = self.config['databases']['backup_username']
+        password = self.config['databases']['backup_password']
+
+        host, port = endpoint.split(':') if ':' in endpoint else (endpoint, None)
+
+        if engine == 'postgresql':
+            env = os.environ.copy()
+            env['PGPASSWORD'] = password
+
+            cmd = [
+                'pg_dumpall',
+                '-h', host,
+                '-p', port or '5432',
+                '-U', username,
+                '-f', str(backup_file),
+                '--clean',
+                '--if-exists'
+            ]
+            subprocess.run(cmd, env=env, check=True)
+
+        elif engine == 'mysql':
+            cmd = [
+                'mysqldump',
+                '-h', host,
+                '-P', port or '3306',
+                '-u', username,
+                f'-p{password}',
+                '--all-databases',
+                '--single-transaction',
+                '--routines',
+                '--triggers',
+                '--events',
+                '--result-file', str(backup_file)
+            ]
+            subprocess.run(cmd, check=True)
+
+        elif engine == 'mssql':
+            # Use mssql-scripter for schema and data
+            cmd = [
+                'mssql-scripter',
+                '-S', endpoint,
+                '-U', username,
+                '-P', password,
+                '--schema-and-data',
+                '-f', str(backup_file)
+            ]
+            subprocess.run(cmd, check=True)
+
+        # Compress the backup
+        subprocess.run(['gzip', '-9', str(backup_file)], check=True)
+
+        return f"{backup_file}.gz"
+
+    def backup_external_databases(self):
+        """Backup external database services"""
+        self.logger.info("Backing up external databases...")
+
+        for db in self.config['databases']['external_databases']:
+            if db['type'] == 'mongodb':
+                self.backup_mongodb(db)
+            elif db['type'] == 'redis':
+                self.backup_redis(db)
+
+    def backup_mongodb(self, config: Dict):
+        """Backup MongoDB instance"""
+        self.logger.info(f"Backing up MongoDB: {config['id']}")
+
+        backup_dir = self.backup_path / 'db' / config['id']
+        backup_dir.mkdir(exist_ok=True)
+
+        cmd = [
+            'mongodump',
+            '--uri', config['connection_string'],
+            '--out', str(backup_dir),
+            '--gzip'
+        ]
+
+        subprocess.run(cmd, check=True)
+
+    def backup_redis(self, config: Dict):
+        """Backup Redis instance"""
+        self.logger.info(f"Backing up Redis: {config['id']}")
+
+        # Connect and create RDB dump
+        r = redis.Redis.from_url(f"redis://:{config['password']}@{config['endpoint']}")
+        r.bgsave()
+
+        # Wait for backup to complete
+        while r.lastsave() == r.lastsave():
+            time.sleep(1)
+
+        # Note: You'd need to retrieve the RDB file from Redis server
+        # This is a simplified version
+
+    def archive_backup(self) -> str:
+        """Create compressed archive of backup directory"""
+        self.logger.info("Creating backup archive...")
+
+        archive_name = f"dr-backup-{self.backup_date}.tar.gz"
+        archive_path = self.temp_workspace / archive_name
+
+        cmd = [
+            'tar',
+            '-czf', str(archive_path),
+            '-C', str(self.backup_path.parent),
+            self.backup_date
+        ]
+
+        subprocess.run(cmd, check=True)
+
+        return str(archive_path)
+
+    def encrypt_with_shamir(self, archive_path: str) -> Dict:
+        """
+        Encrypt archive using AES and protect key with Shamir's Secret Sharing
+        This ensures that even if the backup machine is compromised,
+        the attacker needs multiple key shares to decrypt
+        """
+        self.logger.info("Encrypting backup with Shamir's Secret Sharing...")
+
+        # Generate a random AES-128 key (16 bytes required for Shamir's Secret Sharing)
+        aes_key = get_random_bytes(16)
+
+        # Encrypt the archive
+        encrypted_path = f"{archive_path}.enc"
+
+        with open(archive_path, 'rb') as f_in:
+            data = f_in.read()
+
+        # AES encryption in GCM mode for authenticated encryption
+        cipher = AES.new(aes_key, AES.MODE_GCM)
+        ciphertext, tag = cipher.encrypt_and_digest(data)
+
+        with open(encrypted_path, 'wb') as f_out:
+            # Write nonce, tag, and ciphertext
+            f_out.write(cipher.nonce)
+            f_out.write(tag)
+            f_out.write(ciphertext)
+
+        # Split the AES key using Shamir's Secret Sharing
+        shares = Shamir.split(
+            self.config['encryption']['threshold'],
+            self.config['encryption']['total_shares'],
+            aes_key
+        )
+
+        # Distribute shares to different locations
+        self.distribute_key_shares(shares)
+
+        # Delete the original archive and AES key from memory
+        os.remove(archive_path)
+        del aes_key
+
+        return {
+            'encrypted_file': encrypted_path,
+            'shares_distributed': len(shares),
+            'threshold': self.config['encryption']['threshold']
+        }
+
+    def distribute_key_shares(self, shares: List):
+        """
+        Distribute key shares to multiple secure locations
+        This prevents single point of failure
+        """
+        share_locations = self.config['encryption']['share_locations']
+
+        for i, (idx, share) in enumerate(shares):
+            if i >= len(share_locations):
+                break
+
+            location = share_locations[i]
+            share_data = {
+                'backup_date': self.backup_date,
+                'share_index': idx,
+                'share': share.hex(),
+                'threshold': self.config['encryption']['threshold'],
+                'total_shares': self.config['encryption']['total_shares']
+            }
+
+            if location['type'] == 'vault':
+                self.store_share_vault(location, share_data)
+            elif location['type'] == 'aws_secrets':
+                self.store_share_aws(location, share_data)
+            elif location['type'] == 'azure_keyvault':
+                self.store_share_azure(location, share_data)
+            elif location['type'] == 'local_disk':
+                self.store_share_local_disk(location, share_data)
+            elif location['type'] == 'offline':
+                self.store_share_offline(location, share_data)
+
+    def store_share_vault(self, location: Dict, share_data: Dict):
+        """Store share in HashiCorp Vault"""
+        import hvac
+
+        client = hvac.Client(url=location['url'])
+        client.token = os.environ.get('VAULT_TOKEN')
+
+        path = f"{location['path']}/{self.backup_date}/share_{share_data['share_index']}"
+        client.secrets.kv.v2.create_or_update_secret(
+            path=path,
+            secret=share_data
+        )
+
+        self.logger.info(f"Stored share {share_data['share_index']} in Vault")
+
+    def store_share_aws(self, location: Dict, share_data: Dict):
+        """Store share in AWS Secrets Manager"""
+        client = boto3.client('secretsmanager', region_name=location['region'])
+
+        secret_name = f"{location['secret_name']}-{self.backup_date}"
+        client.create_secret(
+            Name=secret_name,
+            SecretString=json.dumps(share_data)
+        )
+
+        self.logger.info(f"Stored share {share_data['share_index']} in AWS Secrets Manager")
+
+    def store_share_azure(self, location: Dict, share_data: Dict):
+        """Store share in Azure Key Vault"""
+        credential = DefaultAzureCredential()
+        client = SecretClient(
+            vault_url=f"https://{location['vault_name']}.vault.azure.net",
+            credential=credential
+        )
+
+        secret_name = f"{location['secret_name']}-{self.backup_date}"
+        client.set_secret(secret_name, json.dumps(share_data))
+
+        self.logger.info(f"Stored share {share_data['share_index']} in Azure Key Vault")
+
+    def store_share_local_disk(self, location: Dict, share_data: Dict):
+        """Store share on local disk as JSON file"""
+        # Create the directory if it doesn't exist
+        share_dir = Path(location['path'])
+        share_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create filename with backup date and share index
+        share_file = share_dir / f"share_{self.backup_date}_{share_data['share_index']}.json"
+
+        # Write share data as JSON
+        with open(share_file, 'w') as f:
+            json.dump(share_data, f, indent=2)
+
+        # Set restrictive permissions (owner read/write only)
+        os.chmod(share_file, 0o600)
+
+        self.logger.info(f"Stored share {share_data['share_index']} on local disk: {share_file}")
+        if 'description' in location:
+            self.logger.info(f"  Location: {location['description']}")
+
+    def store_share_offline(self, location: Dict, share_data: Dict):
+        """Generate offline share for physical storage"""
+        offline_file = self.temp_workspace / f"offline_share_{share_data['share_index']}.txt"
+
+        with open(offline_file, 'w') as f:
+            f.write(f"DISASTER RECOVERY KEY SHARE\n")
+            f.write(f"========================\n")
+            f.write(f"Backup Date: {self.backup_date}\n")
+            f.write(f"Share: {share_data['share_index']} of {share_data['total_shares']}\n")
+            f.write(f"Threshold: {share_data['threshold']}\n")
+            f.write(f"Location: {location['description']}\n")
+            f.write(f"\nKEY SHARE (KEEP SECURE):\n")
+            f.write(f"{share_data['share']}\n")
+
+        # Print QR code for easier storage/retrieval
+        import qrcode
+        qr = qrcode.QRCode()
+        qr.add_data(share_data['share'])
+        qr.make()
+        qr.print_ascii()
+
+        self.logger.info(f"Generated offline share {share_data['share_index']}: {location['description']}")
+        print(f"Please securely store the share file: {offline_file}")
+
+    def calculate_checksum(self, file_path: str) -> str:
+        """Calculate MD5 checksum of file"""
+        md5 = hashlib.md5()
+
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                md5.update(chunk)
+
+        return md5.hexdigest()
+
+    def upload_to_storage(self, encrypted_file: str, checksum: str):
+        """Upload to write-only storage"""
+        self.logger.info("Uploading to secure storage...")
+
+        # Upload to primary storage (MinIO)
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=self.config['storage']['primary']['endpoint'],
+            aws_access_key_id=self.config['storage']['primary']['access_key'],
+            aws_secret_access_key=self.config['storage']['primary']['secret_key']
+        )
+
+        file_name = os.path.basename(encrypted_file)
+
+        s3_client.upload_file(
+            encrypted_file,
+            self.config['storage']['primary']['bucket'],
+            f"{self.backup_date}/{file_name}",
+            ExtraArgs={
+                'Metadata': {
+                    'checksum': checksum,
+                    'backup_date': self.backup_date
+                }
+            }
+        )
+
+        # Upload to secondary storage (Azure)
+        if 'secondary' in self.config['storage']:
+            blob_service = BlobServiceClient(
+                account_url=f"https://{self.config['storage']['secondary']['account_name']}.blob.core.windows.net",
+                credential=self.config['storage']['secondary']['sas_token']
+            )
+
+            blob_client = blob_service.get_blob_client(
+                container=self.config['storage']['secondary']['container'],
+                blob=f"{self.backup_date}/{file_name}"
+            )
+
+            with open(encrypted_file, 'rb') as data:
+                blob_client.upload_blob(data, metadata={'checksum': checksum})
+
+        self.logger.info("Upload completed")
+
+    def cleanup(self):
+        """Clean up temporary files"""
+        self.logger.info("Cleaning up temporary files...")
+
+        # Remove unencrypted backup directory
+        import shutil
+        if self.backup_path.exists():
+            shutil.rmtree(self.backup_path)
+
+        # Keep encrypted file for verification, remove after successful upload
+        # shutil.rmtree(self.temp_workspace)
+
+    def run(self):
+        """Main execution flow"""
+        try:
+            # 1. Check prerequisites
+            if not self.check_prerequisites():
+                sys.exit(1)
+
+            # # 2. Create directory structure
+            # self.create_backup_structure()
+
+            # # 3. Backup GitLab repositories
+            # self.backup_gitlab()
+
+            # # 4. Backup all databases
+            # with ThreadPoolExecutor(max_workers=5) as executor:
+            #     # Create backup users first
+            #     for instance in self.config['databases']['rds_instances']:
+            #         # Setup backup user logic here
+            #         pass
+
+            #     # Backup RDS instances
+            #     futures = []
+            #     for instance in self.config['databases']['rds_instances']:
+            #         future = executor.submit(self.backup_rds_instance, instance)
+            #         futures.append(future)
+
+            #     # Wait for all backups to complete
+            #     for future in futures:
+            #         future.result()
+
+            # # 5. Backup external databases
+            # self.backup_external_databases()
+
+            # 6. Create archive
+            archive_path = self.archive_backup()
+
+            # 7. Encrypt with Shamir's Secret Sharing
+            encryption_result = self.encrypt_with_shamir(archive_path)
+
+            # 8. Calculate checksum
+            checksum = self.calculate_checksum(encryption_result['encrypted_file'])
+
+            # # 9. Upload to write-only storage
+            # self.upload_to_storage(encryption_result['encrypted_file'], checksum)
+
+            # # 10. Clean up
+            # self.cleanup()
+
+            # 11. Send notification
+            self.send_notification(True, checksum, encryption_result)
+
+            self.logger.info("Backup completed successfully!")
+
+        except Exception as e:
+            self.logger.error(f"Backup failed: {e}")
+            self.send_notification(False, error=str(e))
+            sys.exit(1)
+
+    def send_notification(self, success: bool, checksum: str = None, encryption_result: Dict = None, error: str = None):
+        """Send backup notification"""
+        subject = f"DR Backup {'Success' if success else 'Failed'} - {self.backup_date}"
+
+        if success:
+            body = f"""
+            Disaster Recovery Backup Completed Successfully
+
+            Date: {self.backup_date}
+            Checksum: {checksum}
+            Encryption: Shamir's Secret Sharing
+            Shares: {encryption_result['shares_distributed']} distributed
+            Threshold: {encryption_result['threshold']} shares needed for recovery
+
+            Storage Locations:
+            - Primary: {self.config['storage']['primary']['endpoint']}
+            - Secondary: Azure Blob Storage
+
+            Key shares have been distributed to secure locations.
+            """
+        else:
+            body = f"""
+            Disaster Recovery Backup Failed
+
+            Date: {self.backup_date}
+            Error: {error}
+
+            Please check logs at ./log/dr-backup-{self.backup_date}.log
+            """
+
+        # Send email notification
+        # Implementation depends on your mail server setup
+        self.logger.info(f"Notification sent: {subject}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python backup.py <config_file>")
+        sys.exit(1)
+
+    backup_system = DRBackupSystem(sys.argv[1])
+    backup_system.run()

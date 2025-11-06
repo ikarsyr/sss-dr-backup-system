@@ -1,0 +1,86 @@
+# config.yaml
+general:
+  backup_source_base_path: /tmp/backup-source-folder
+  backup_target_base_path: /tmp/backup-target-folder
+  log_level: INFO
+  notification_email: your_email@domain.com
+
+gitlab:
+  url: https://gitlab.com/
+  token_env: your_secure_token
+  group: yout_gitlab_group
+  include_subgroups: true
+  per_page: 100
+
+alibaba:
+  access_key_id_env: ALIBABA_ACCESS_KEY
+  access_key_secret_env: ALIBABA_ACCESS_SECRET
+  region: cn-hangzhou
+
+databases:
+  backup_username: backup_reader
+  backup_password_env: DB_BACKUP_PASSWORD
+
+  rds_instances:
+    - id: pgprod01
+      engine: postgresql
+      endpoint: pgprod.rds.aliyuncs.com:5432
+      databases: ['gamedb', 'analytics']
+
+    - id: mssqlprod01
+      engine: mssql
+      endpoint: mssql.rds.aliyuncs.com:1433
+      databases: ['transactions', 'users']
+
+    - id: mysqlprod01
+      engine: mysql
+      endpoint: mysql.rds.aliyuncs.com:3306
+      databases: all  # Backs up all databases
+
+  external_databases:
+    - id: mongodb_atlas
+      type: mongodb
+      connection_string_env: MONGODB_URI
+      databases: ['game_state', 'player_profiles']
+
+    - id: redis_cloud
+      type: redis
+      endpoint: redis-12345.c1.us-east-1.aws.cloud.redislabs.com:12345
+      password_env: REDIS_PASSWORD
+
+encryption:
+  method: shamir  # Shamir's Secret Sharing
+  total_shares: 3
+  threshold: 2
+  share_locations:
+    - type: vault
+      url: https://vault.yourcompany.com
+      path: /secret/dr-keys
+    - type: aws_secrets
+      region: us-east-1
+      secret_name: dr-backup-share-2
+    - type: azure_keyvault
+      vault_name: tgc-keyvault
+      secret_name: dr-share-3
+    - type: local_disk
+      path: /tmp/backup/shares1
+      description: "Local secure disk 1"
+    - type: offline
+      description: "Physical safe - Office A"
+    - type: offline
+      description: "Safety deposit box - Bank B"
+
+storage:
+  primary:
+    type: s3
+    endpoint: https://minio.yourcompany.local
+    bucket: dr-backups
+    access_key_env: MINIO_ACCESS_KEY
+    secret_key_env: MINIO_SECRET_KEY
+    write_only: true
+
+  secondary:
+    type: azure_blob
+    account_name: tgcbackups
+    container: disaster-recovery
+    sas_token_env: AZURE_SAS_TOKEN
