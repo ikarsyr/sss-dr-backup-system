@@ -1,8 +1,8 @@
 Hi {name},
 
-This is an automated notification about recent backup of the DB and Code completion.
+This is an automated notification about recent backup completion.
 
-Details:
+1. Details:
 - Date: {backup_date}
 - Contents:
 {rds_instances}
@@ -11,9 +11,18 @@ Details:
 - Checksum: {checksum}
 - Location: {storage_location}
 
-Your decryption key share is attached to this email.
+2. Key share structure:
+- Total shares: {total_shares}
+- Minimum for decrypt: {threshold}
+- Key-share locations:
+{share_locations}
 
-You will need at least {threshold} shares from share-holders to decrypt this backup file. Remember, backup for each day uses different key shares.
+This backup is encrypted with AES-128-GCM (Advanced Encryption Standard, 128-bit key, Galois/Counter Mode). You will need at least {threshold} keys (key-shares) from the key-share holders to decrypt this backup file. Your decryption key share is attached to this email.
+
+Remember, backup for each day uses different key shares.
+
+3. Recovery
+In order to decrypt a backup, you need to follow the guideline described in RECOVER.md manual: https://github.com/svscorp/sss-dr-backup-system/blob/main/RECOVER.md
 
 Best regards,
-Disaster Recovery Backup System
+Secure Distributed Backup System

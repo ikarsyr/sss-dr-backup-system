@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Disaster Recovery Restoration Script
+Secure Distributed Restoration Script
 Requires threshold number of key shares to decrypt and restore
 """
 

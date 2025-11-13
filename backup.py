@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enterprise Disaster Recovery Backup System
+Enterprise Secure Distributed Backup System
 Implements Shamir's Secret Sharing for key protection
 """
 
@@ -111,7 +111,17 @@ class DRBackupSystem:
 
         self.logger.info("Starting GitLab backup...")
 
-        os.chdir(self.backup_path / 'git')
+        git_backup_dir = self.backup_path / 'git'
+
+        # Clean existing git backup directory to avoid conflicts
+        if git_backup_dir.exists() and any(git_backup_dir.iterdir()):
+            self.logger.info("Cleaning existing git backup directory...")
+            import shutil
+            for item in git_backup_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
 
         cmd = [
             'glab', 'repo', 'clone',
@@ -123,7 +133,7 @@ class DRBackupSystem:
         env = os.environ.copy()
         env['GITLAB_TOKEN'] = self.config['gitlab']['token']
 
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        result = subprocess.run(cmd, env=env, cwd=str(git_backup_dir), capture_output=True, text=True)
 
         if result.returncode != 0:
             self.logger.error(f"GitLab backup failed: {result.stderr}")
@@ -221,8 +231,22 @@ class DRBackupSystem:
                     ]
                     subprocess.run(cmd, env=env, check=True)
 
-                    # Compress individual backup
-                    subprocess.run(['gzip', '-9', str(db_backup_file)], check=True)
+                    # Validate SQL file was created and has content
+                    if not db_backup_file.exists():
+                        error_msg = f"pg_dump did not create output file for {db_name} at {db_backup_file}"
+                        self.logger.error(error_msg)
+                        raise Exception(error_msg)
+
+                    file_size = db_backup_file.stat().st_size
+                    if file_size == 0:
+                        error_msg = f"pg_dump created empty file for {db_name}"
+                        self.logger.error(error_msg)
+                        raise Exception(error_msg)
+
+                    self.logger.info(f"  SQL dump size: {file_size / (1024*1024):.2f} MB")
+
+                    # Compress individual backup using absolute path
+                    subprocess.run(['gzip', '-9', str(db_backup_file.absolute())], check=True)
 
                 # Return the first one for compatibility
                 backup_file = self.backup_path / 'db' / f"{instance['id']}_{databases[0]}.sql.gz"
@@ -238,8 +262,16 @@ class DRBackupSystem:
                     '--if-exists'
                 ]
                 subprocess.run(cmd, env=env, check=True)
-                # Compress the backup
-                subprocess.run(['gzip', '-9', str(backup_file)], check=True)
+
+                # Validate and compress the backup
+                if not backup_file.exists():
+                    error_msg = f"pg_dumpall did not create output file at {backup_file}"
+                    self.logger.error(error_msg)
+                    raise Exception(error_msg)
+
+                file_size = backup_file.stat().st_size
+                self.logger.info(f"  SQL dump size: {file_size / (1024*1024):.2f} MB")
+                subprocess.run(['gzip', '-9', str(backup_file.absolute())], check=True)
                 backup_file = f"{backup_file}.gz"
 
         elif engine == 'mysql':
@@ -257,31 +289,94 @@ class DRBackupSystem:
                 '--result-file', str(backup_file)
             ]
             subprocess.run(cmd, check=True)
-            # Compress the backup
-            subprocess.run(['gzip', '-9', str(backup_file)], check=True)
+
+            # Validate and compress the backup
+            if not backup_file.exists():
+                error_msg = f"mysqldump did not create output file at {backup_file}"
+                self.logger.error(error_msg)
+                raise Exception(error_msg)
+
+            file_size = backup_file.stat().st_size
+            self.logger.info(f"  SQL dump size: {file_size / (1024*1024):.2f} MB")
+            subprocess.run(['gzip', '-9', str(backup_file.absolute())], check=True)
             backup_file = f"{backup_file}.gz"
 
         elif engine == 'mssql':
-            # Use mssql-scripter for schema and data
-            cmd = [
-                'python3', '-m', 'mssql_scripter',
-                '-S', endpoint,
-                '-U', username,
-                '-P', password,
-                '--schema-and-data',
-                '-f', str(backup_file)
-            ]
-            subprocess.run(cmd, check=True)
-            # Compress the backup
-            subprocess.run(['gzip', '-9', str(backup_file)], check=True)
-            backup_file = f"{backup_file}.gz"
+            # Get list of databases to backup
+            databases = instance.get('databases', [])
+
+            if databases and databases != 'all':
+                # Dump each database individually
+                total_dbs = len(databases)
+                for idx, db_name in enumerate(databases, 1):
+                    self.logger.info(f"  Dumping database: {db_name} [{instance['id']}: {idx}/{total_dbs}]")
+                    db_backup_file = self.backup_path / 'db' / f"{instance['id']}_{db_name}.sql"
+
+                    cmd = [
+                        sys.executable, '-m', 'mssqlscripter',
+                        '-S', endpoint,
+                        '-d', db_name,
+                        '-U', username,
+                        '-P', password,
+                        '--schema-and-data',
+                        '-f', str(db_backup_file)
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        self.logger.error(f"mssql-scripter failed for {db_name}: {result.stderr}")
+                        raise Exception(f"mssql-scripter failed for {db_name}: {result.stderr}")
+
+                    # Validate SQL file was created and has content
+                    if not db_backup_file.exists():
+                        error_msg = f"mssql-scripter did not create output file for {db_name} at {db_backup_file}"
+                        self.logger.error(error_msg)
+                        raise Exception(error_msg)
+
+                    file_size = db_backup_file.stat().st_size
+                    if file_size == 0:
+                        error_msg = f"mssql-scripter created empty file for {db_name}"
+                        self.logger.error(error_msg)
+                        raise Exception(error_msg)
+
+                    self.logger.info(f"  SQL dump size: {file_size / (1024*1024):.2f} MB")
+
+                    # Compress individual backup using absolute path
+                    subprocess.run(['gzip', '-9', str(db_backup_file.absolute())], check=True)
+
+                # Return the first one for compatibility
+                backup_file = self.backup_path / 'db' / f"{instance['id']}_{databases[0]}.sql.gz"
+            else:
+                # Backup all databases to single file
+                cmd = [
+                    sys.executable, '-m', 'mssqlscripter',
+                    '-S', endpoint,
+                    '-U', username,
+                    '-P', password,
+                    '--schema-and-data',
+                    '-f', str(backup_file)
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    self.logger.error(f"mssql-scripter failed: {result.stderr}")
+                    raise Exception(f"mssql-scripter failed: {result.stderr}")
+
+                # Validate and compress the backup
+                if not backup_file.exists():
+                    error_msg = f"mssql-scripter did not create output file at {backup_file}"
+                    self.logger.error(error_msg)
+                    raise Exception(error_msg)
+
+                file_size = backup_file.stat().st_size
+                self.logger.info(f"  SQL dump size: {file_size / (1024*1024):.2f} MB")
+                subprocess.run(['gzip', '-9', str(backup_file.absolute())], check=True)
+                backup_file = f"{backup_file}.gz"
 
         return str(backup_file)
 
     def backup_external_databases(self):
         """Backup external database services"""
         # Check if external_databases is configured
-        if 'databases' not in self.config or 'external_databases' not in self.config['databases']:
+        if 'databases' not in self.config or 'external_databases' not in self.config['databases'] or not self.config['databases']['external_databases']:
             self.logger.info("No external databases configured, skipping...")
             return
 
@@ -376,8 +471,21 @@ class DRBackupSystem:
             aes_key
         )
 
-        # Distribute shares to different locations
-        self.distribute_key_shares(shares)
+        # Save shares to temporary files (will be distributed after upload succeeds)
+        shares_temp_dir = self.temp_workspace / 'shares_temp'
+        shares_temp_dir.mkdir(exist_ok=True)
+
+        for i, (idx, share) in enumerate(shares):
+            share_file = shares_temp_dir / f"share_{idx}.json"
+            share_data = {
+                'backup_date': self.backup_date,
+                'share_index': idx,
+                'share': share.hex(),
+                'threshold': self.config['encryption']['threshold'],
+                'total_shares': self.config['encryption']['total_shares']
+            }
+            with open(share_file, 'w') as f:
+                json.dump(share_data, f, indent=2)
 
         # Delete the original archive and AES key from memory
         os.remove(archive_path)
@@ -385,14 +493,55 @@ class DRBackupSystem:
 
         return {
             'encrypted_file': encrypted_path,
-            'shares_distributed': len(shares),
+            'shares_temp_dir': str(shares_temp_dir),
+            'shares_count': len(shares),
             'threshold': self.config['encryption']['threshold']
         }
+
+    def distribute_shares_from_temp(self, shares_temp_dir: str, checksum: str):
+        """
+        Distribute pre-created key shares from temporary storage
+        This is called AFTER successful upload to ensure shares are only distributed
+        when the backup is safely stored
+        """
+        import glob
+
+        self.logger.info("Distributing key shares after successful upload...")
+
+        # Store checksum for email shares
+        self.backup_checksum = checksum
+
+        share_locations = self.config['encryption']['share_locations']
+        share_files = sorted(glob.glob(f"{shares_temp_dir}/share_*.json"))
+
+        for i, share_file in enumerate(share_files):
+            if i >= len(share_locations):
+                break
+
+            location = share_locations[i]
+
+            # Load share data from temp file
+            with open(share_file, 'r') as f:
+                share_data = json.load(f)
+
+            if location['type'] == 'vault':
+                self.store_share_vault(location, share_data)
+            elif location['type'] == 'aws_secrets':
+                self.store_share_aws(location, share_data)
+            elif location['type'] == 'azure_keyvault':
+                self.store_share_azure(location, share_data)
+            elif location['type'] == 'local_disk':
+                self.store_share_local_disk(location, share_data)
+            elif location['type'] == 'email':
+                self.store_share_email(location, share_data)
+            elif location['type'] == 'offline':
+                self.store_share_offline(location, share_data)
 
     def distribute_key_shares(self, shares: List):
         """
         Distribute key shares to multiple secure locations
         This prevents single point of failure
+        DEPRECATED: Use distribute_shares_from_temp() instead for better security
         """
         share_locations = self.config['encryption']['share_locations']
 
@@ -529,7 +678,15 @@ class DRBackupSystem:
         # Get storage location
         storage_location = "Local: " + str(self.temp_workspace)
         if 'storage' in self.config and 'primary' in self.config['storage']:
-            storage_location = f"{self.config['storage']['primary']['endpoint']}/{self.config['storage']['primary']['bucket']}/{self.backup_date}/"
+            storage_location = f"{self.config['storage']['primary']['endpoint']}/{self.config['storage']['primary']['bucket']}/{self.backup_date}/dr-backup-{self.backup_date}.tar.gz.enc"
+
+        # Format share locations
+        share_locations_text = ""
+        for share_loc in self.config['encryption']['share_locations']:
+            share_locations_text += "-- "
+            for key, value in share_loc.items():
+                share_locations_text += f"{key.capitalize()}: {value}. "
+            share_locations_text = share_locations_text.rstrip(". ") + "\n"
 
         # Fill template
         email_body = template.format(
@@ -540,7 +697,9 @@ class DRBackupSystem:
             gitlab_repos=gitlab_text,
             checksum=backup_info.get('checksum', 'Pending'),
             storage_location=storage_location,
-            threshold=self.config['encryption']['threshold']
+            total_shares=self.config['encryption']['total_shares'],
+            threshold=self.config['encryption']['threshold'],
+            share_locations=share_locations_text.rstrip('\n')
         )
 
         # Create email
@@ -582,11 +741,12 @@ class DRBackupSystem:
         info = {
             'rds_instances': [],
             'external_databases': [],
-            'gitlab_repos': []
+            'gitlab_repos': [],
+            'checksum': getattr(self, 'backup_checksum', 'Pending')
         }
 
         # Collect RDS instances
-        if 'databases' in self.config and 'rds_instances' in self.config['databases']:
+        if 'databases' in self.config and 'rds_instances' in self.config['databases'] and self.config['databases']['rds_instances']:
             for instance in self.config['databases']['rds_instances']:
                 info['rds_instances'].append({
                     'id': instance['id'],
@@ -594,7 +754,7 @@ class DRBackupSystem:
                 })
 
         # Collect external databases
-        if 'databases' in self.config and 'external_databases' in self.config['databases']:
+        if 'databases' in self.config and 'external_databases' in self.config['databases'] and self.config['databases']['external_databases']:
             for db in self.config['databases']['external_databases']:
                 info['external_databases'].append({
                     'id': db['id'],
@@ -633,7 +793,7 @@ class DRBackupSystem:
         offline_file = self.temp_workspace / f"offline_share_{share_data['share_index']}.txt"
 
         with open(offline_file, 'w') as f:
-            f.write(f"DISASTER RECOVERY KEY SHARE\n")
+            f.write(f"BACKUP RECOVERY KEY SHARE\n")
             f.write(f"========================\n")
             f.write(f"Backup Date: {self.backup_date}\n")
             f.write(f"Share: {share_data['share_index']} of {share_data['total_shares']}\n")
@@ -672,26 +832,90 @@ class DRBackupSystem:
         self.logger.info("Uploading to secure storage...")
 
         # Upload to primary storage
-        s3_client = boto3.client(
-            's3',
-            endpoint_url=self.config['storage']['primary']['endpoint'],
-            aws_access_key_id=self.config['storage']['primary']['access_key'],
-            aws_secret_access_key=self.config['storage']['primary']['secret_key']
-        )
+        storage_type = self.config['storage']['primary'].get('type', 's3')
 
-        file_name = os.path.basename(encrypted_file)
+        if storage_type == 's3' and 'aliyuncs.com' in self.config['storage']['primary']['endpoint']:
+            # Use Alibaba OSS SDK for Alibaba Cloud
+            try:
+                import oss2
+            except ImportError:
+                raise Exception("oss2 library required for Alibaba Cloud OSS. Install with: pip install oss2")
 
-        s3_client.upload_file(
-            encrypted_file,
-            self.config['storage']['primary']['bucket'],
-            f"{self.backup_date}/{file_name}",
-            ExtraArgs={
-                'Metadata': {
-                    'checksum': checksum,
-                    'backup_date': self.backup_date
+            # Extract region from endpoint (e.g., oss-me-central-1.aliyuncs.com -> me-central-1)
+            endpoint = self.config['storage']['primary']['endpoint']
+
+            auth = oss2.Auth(
+                self.config['storage']['primary']['access_key'],
+                self.config['storage']['primary']['secret_key']
+            )
+            bucket = oss2.Bucket(
+                auth,
+                endpoint,
+                self.config['storage']['primary']['bucket']
+            )
+
+            file_name = os.path.basename(encrypted_file)
+            object_key = f"{self.backup_date}/{file_name}"
+
+            try:
+                # Get file size to determine upload method
+                file_size = os.path.getsize(encrypted_file)
+
+                # Upload with metadata
+                headers = {
+                    'x-oss-meta-checksum': checksum,
+                    'x-oss-meta-backup-date': self.backup_date
                 }
-            }
-        )
+
+                # Use resumable upload for files larger than 100MB
+                if file_size > 100 * 1024 * 1024:
+                    self.logger.info(f"Large file detected ({file_size / (1024*1024*1024):.2f} GB), using resumable upload...")
+                    # Resumable upload with 100MB part size for better efficiency
+                    oss2.resumable_upload(
+                        bucket,
+                        object_key,
+                        encrypted_file,
+                        headers=headers,
+                        part_size=100 * 1024 * 1024,
+                        num_threads=4
+                    )
+                else:
+                    # Simple upload for smaller files with extended timeout
+                    bucket.put_object_from_file(object_key, encrypted_file, headers=headers)
+
+                self.logger.info(f"Successfully uploaded to {self.config['storage']['primary']['bucket']}/{object_key}")
+            except Exception as e:
+                raise Exception(f"Failed to upload {encrypted_file} to {self.config['storage']['primary']['bucket']}/{object_key}: {e}")
+        else:
+            # Use boto3 for AWS S3 and other S3-compatible storage
+            from botocore.config import Config
+
+            s3_config = Config(signature_version='v4')
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=self.config['storage']['primary'].get('endpoint'),
+                aws_access_key_id=self.config['storage']['primary']['access_key'],
+                aws_secret_access_key=self.config['storage']['primary']['secret_key'],
+                config=s3_config
+            )
+
+            file_name = os.path.basename(encrypted_file)
+
+            try:
+                s3_client.upload_file(
+                    encrypted_file,
+                    self.config['storage']['primary']['bucket'],
+                    f"{self.backup_date}/{file_name}",
+                    ExtraArgs={
+                        'Metadata': {
+                            'checksum': checksum,
+                            'backup_date': self.backup_date
+                        }
+                    }
+                )
+                self.logger.info(f"Successfully uploaded to {self.config['storage']['primary']['bucket']}/{self.backup_date}/{file_name}")
+            except Exception as e:
+                raise Exception(f"Failed to upload {encrypted_file} to {self.config['storage']['primary']['bucket']}/{self.backup_date}/{file_name}: {e}")
 
         # Upload to secondary storage (Azure) if configured
         if 'secondary' in self.config['storage']:
@@ -720,7 +944,7 @@ class DRBackupSystem:
             shutil.rmtree(self.backup_path)
 
         # Keep encrypted file for verification, remove after successful upload
-        # shutil.rmtree(self.temp_workspace)
+        shutil.rmtree(self.temp_workspace)
 
     def run(self):
         """Main execution flow"""
@@ -736,21 +960,25 @@ class DRBackupSystem:
             # self.backup_gitlab()
 
             # 4. Backup all databases
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                # Create backup users first
-                for instance in self.config['databases']['rds_instances']:
-                    # Setup backup user logic here
-                    pass
+            # Check if RDS instances are configured
+            if 'databases' in self.config and 'rds_instances' in self.config['databases'] and self.config['databases']['rds_instances']:
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    # Create backup users first
+                    for instance in self.config['databases']['rds_instances']:
+                        # Setup backup user logic here
+                        pass
 
-                # Backup RDS instances
-                futures = []
-                for instance in self.config['databases']['rds_instances']:
-                    future = executor.submit(self.backup_rds_instance, instance)
-                    futures.append(future)
+                    # Backup RDS instances
+                    futures = []
+                    for instance in self.config['databases']['rds_instances']:
+                        future = executor.submit(self.backup_rds_instance, instance)
+                        futures.append(future)
 
-                # Wait for all backups to complete
-                for future in futures:
-                    future.result()
+                    # Wait for all backups to complete
+                    for future in futures:
+                        future.result()
+            else:
+                self.logger.info("No RDS instances configured, skipping...")
 
             # 5. Backup external databases
             self.backup_external_databases()
@@ -758,19 +986,22 @@ class DRBackupSystem:
             # 6. Create archive
             archive_path = self.archive_backup()
 
-            # 7. Encrypt with Shamir's Secret Sharing
+            # 7. Encrypt with Shamir's Secret Sharing (creates shares in temp location)
             encryption_result = self.encrypt_with_shamir(archive_path)
 
             # 8. Calculate checksum
             checksum = self.calculate_checksum(encryption_result['encrypted_file'])
 
-            # # 9. Upload to write-only storage
-            # self.upload_to_storage(encryption_result['encrypted_file'], checksum)
+            # 9. Upload to write-only storage
+            self.upload_to_storage(encryption_result['encrypted_file'], checksum)
 
-            # # 10. Clean up
-            # self.cleanup()
+            # 10. Distribute key shares (ONLY after successful upload)
+            self.distribute_shares_from_temp(encryption_result['shares_temp_dir'], checksum)
 
-            # 11. Send notification
+            # 11. Clean up
+            self.cleanup()
+
+            # 12. Send notification
             self.send_notification(True, checksum, encryption_result)
 
             self.logger.info("Backup completed successfully!")
@@ -786,23 +1017,22 @@ class DRBackupSystem:
 
         if success:
             body = f"""
-            Disaster Recovery Backup Completed Successfully
+            Secure Distributed Backup Completed Successfully
 
             Date: {self.backup_date}
             Checksum: {checksum}
             Encryption: Shamir's Secret Sharing
-            Shares: {encryption_result['shares_distributed']} distributed
+            Shares: {encryption_result['shares_count']} distributed
             Threshold: {encryption_result['threshold']} shares needed for recovery
 
             Storage Locations:
             - Primary: {self.config['storage']['primary']['endpoint']}
-            - Secondary: Azure Blob Storage
 
             Key shares have been distributed to secure locations.
             """
         else:
             body = f"""
-            Disaster Recovery Backup Failed
+            Secure Distributed Backup Failed
 
             Date: {self.backup_date}
             Error: {error}

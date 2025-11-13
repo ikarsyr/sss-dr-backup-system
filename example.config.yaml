@@ -7,19 +7,19 @@ general:
 
 gitlab:
   url: https://gitlab.com/
-  token_env: your_secure_token
+  token: your_secure_token
   group: yout_gitlab_group
   include_subgroups: true
   per_page: 100
 
 alibaba:
-  access_key_id_env: ALIBABA_ACCESS_KEY
-  access_key_secret_env: ALIBABA_ACCESS_SECRET
+  access_key_id: ALIBABA_ACCESS_KEY
+  access_key_secret: ALIBABA_ACCESS_SECRET
   region: cn-hangzhou
 
 databases:
   backup_username: backup_reader
-  backup_password_env: DB_BACKUP_PASSWORD
+  backup_password: DB_BACKUP_PASSWORD
 
   rds_instances:
     - id: pgprod01
@@ -40,13 +40,13 @@ databases:
   external_databases:
     - id: mongodb_atlas
       type: mongodb
-      connection_string_env: MONGODB_URI
+      connection_string: MONGODB_URI
       databases: ['game_state', 'player_profiles']
 
     - id: redis_cloud
       type: redis
       endpoint: redis-12345.c1.us-east-1.aws.cloud.redislabs.com:12345
-      password_env: REDIS_PASSWORD
+      password: REDIS_PASSWORD
 
 encryption:
   method: shamir  # Shamir's Secret Sharing
@@ -79,12 +79,12 @@ storage:
     type: s3
     endpoint: https://minio.yourcompany.local
     bucket: dr-backups
-    access_key_env: MINIO_ACCESS_KEY
-    secret_key_env: MINIO_SECRET_KEY
+    access_key: MINIO_ACCESS_KEY
+    secret_key: MINIO_SECRET_KEY
     write_only: true
 
   secondary:
     type: azure_blob
     account_name: tgcbackups
     container: disaster-recovery
-    sas_token_env: AZURE_SAS_TOKEN
+    sas_token: AZURE_SAS_TOKEN
