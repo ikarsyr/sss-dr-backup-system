@@ -956,8 +956,8 @@ class DRBackupSystem:
             # 2. Create directory structure
             self.create_backup_structure()
 
-            # # 3. Backup GitLab repositories
-            # self.backup_gitlab()
+            # 3. Backup GitLab repositories
+            self.backup_gitlab()
 
             # 4. Backup all databases
             # Check if RDS instances are configured
