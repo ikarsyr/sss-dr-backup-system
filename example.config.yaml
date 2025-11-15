@@ -12,6 +12,19 @@ gitlab:
   include_subgroups: true
   per_page: 100
 
+# Map repositories to their databases
+# Format: "relative/path/to/repo": "rds_instance_id.database_name"
+# Path is relative to the root group specified above
+repository_to_db_mapping:
+  "backend/api-service": "pgprod01.main_db"
+  "backend/auth-service": "pgprod01.auth_db"
+  "frontend/web-app": "mssqlprod01.users"
+
+# Optional: Override backup folder structure
+# Format: "gitlab/path/to/repo": "backup/custom/path"
+backup_path_overrides:
+  "legacy/old-service": "archive/legacy/old-service"
+
 alibaba:
   access_key_id: ALIBABA_ACCESS_KEY
   access_key_secret: ALIBABA_ACCESS_SECRET

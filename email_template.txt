@@ -4,12 +4,11 @@ This is an automated notification about recent backup completion.
 
 1. Details:
 - Date: {backup_date}
-- Contents:
-{rds_instances}
-{external_databases}
-{gitlab_repos}
 - Checksum: {checksum}
 - Location: {storage_location}
+
+Backup Structure:
+{backup_structure}
 
 2. Key share structure:
 - Total shares: {total_shares}

@@ -6,11 +6,12 @@ Enterprise backup system implementing Shamir's Secret Sharing for enhanced secur
 
 ## Features
 
-- **Shamir's Secret Sharing**: Encryption key split into multiple shares, requiring a threshold number to decrypt
+- **Shamir's Secret Sharing**: Encryption key split into multiple shares, requiring threshold to decrypt
 - **AES-GCM Encryption**: Authenticated encryption for backup archives
-- **Multiple Share Storage**: Vault, AWS Secrets Manager, Azure Key Vault, local disk, and offline storage
-- **GitLab Repository Backup**: Clone all repositories from a GitLab group
-- **Database Backup**: Support for PostgreSQL, MySQL, MSSQL, MongoDB, and Redis
+- **Multiple Share Storage**: Vault, AWS Secrets Manager, Azure Key Vault, local disk, email, and offline
+- **Structured GitLab Backup**: Nested folder structure matching GitLab groups/subgroups with code and database co-location
+- **Database Backup**: PostgreSQL, MySQL, MSSQL, MongoDB, Redis with automatic organization by repository
+- **Repository-to-Database Mapping**: Databases organized alongside their corresponding repositories
 - **Configurable**: YAML-based configuration with environment variable support
 
 ## Prerequisites
@@ -24,43 +25,48 @@ Enterprise backup system implementing Shamir's Secret Sharing for enhanced secur
 
 ## Configuration
 
-Create a `config.yaml` file with your backup settings:
+Create a `config.yaml` file with your backup settings. See `example.config.yaml` for full options.
+
+### Basic Structure
 
 ```yaml
 general:
-  backup_source_base_path: .              # Source directory to backup
-  backup_target_base_path: /tmp/backup   # Where encrypted backups are stored
+  backup_source_base_path: .              # Where daily backup folders are created
+  backup_target_base_path: /tmp/backup   # Temp workspace for encryption
   log_level: INFO
+
+gitlab:
+  group: your_root_group                  # Root GitLab group ID
+  token: glpat-xxx
+  include_subgroups: true
+
+# Map repositories to databases (optional)
+repository_to_db_mapping:
+  "backend/api-service": "pgprod01.main_db"
+  "backend/auth-service": "pgprod01.auth_db"
+
+# Override backup folder structure (optional)
+backup_path_overrides:
+  "legacy/old-service": "archive/legacy/old-service"
+
+databases:
+  backup_username: backup_reader
+  backup_password: secure_password
+  rds_instances:
+    - id: pgprod01
+      engine: postgresql
+      endpoint: db.example.com:5432
+      databases: ['main_db', 'auth_db']
 
 encryption:
   method: shamir
-  total_shares: 3      # Total number of shares to create
-  threshold: 2         # Minimum shares needed to decrypt
+  total_shares: 3
+  threshold: 2
   share_locations:
-    - type: local_disk
-      path: /secure/share1
-      description: "Backup server 1"
-    - type: local_disk
-      path: /secure/share2
-      description: "Backup server 2"
     - type: email
       name: "John Doe"
-      address: "john.doe@example.com"
-      description: "CTO - Shareholder 3"
-    - type: vault
-      url: https://vault.company.com
-      path: /secret/backup-shares
-
-# Optional: SMTP configuration for email shares
-smtp:
-  host: smtp.gmail.com
-  port: 587
-  username_env: SMTP_USERNAME
-  password_env: SMTP_PASSWORD
-  use_tls: true
+      address: "john@example.com"
 ```
-
-See `config.yaml` for full configuration options.
 
 ## Usage
 
@@ -78,10 +84,28 @@ This will:
 5. Distribute shares to configured locations
 6. Output the encrypted backup file
 
-**Output locations:**
+**Output:**
 - Encrypted backup: `{backup_target_base_path}/{date}/dr-backup-{date}.tar.gz.enc`
-- Key shares: As configured in `share_locations`
+- Key shares: Distributed per `share_locations`
 - Logs: `./log/dr-backup-{date}.log`
+
+**Backup Structure:**
+```
+2025-11-15/
+├── _dbs_not_part_of_a_project/    # Orphan databases (if any)
+├── backend/
+│   ├── api-service/
+│   │   ├── code/                  # Git repository
+│   │   └── db/                    # Database dumps (if mapped)
+│   └── auth-service/
+│       ├── code/
+│       └── db/
+└── infrastructure/
+    └── terraform/
+        └── code/
+```
+
+Repositories clone into nested `{group}/{subgroup}/{project}/code/` structure. Mapped databases organize into corresponding `{project}/db/` folders.
 
 ### Restoring a Backup
 

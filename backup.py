@@ -30,6 +30,9 @@ from azure.keyvault.secrets import SecretClient
 from azure.identity import DefaultAzureCredential
 
 class DRBackupSystem:
+    # Constants
+    ORPHAN_DB_FOLDER = '_dbs_not_part_of_a_project'
+
     def __init__(self, config_path: str):
         self.config = self.load_config(config_path)
         self.backup_date = datetime.now().strftime('%Y-%m-%d')
@@ -98,12 +101,13 @@ class DRBackupSystem:
         """Create backup directory structure"""
         self.logger.info(f"Creating backup structure at {self.backup_path}")
 
-        (self.backup_path / 'git').mkdir(parents=True, exist_ok=True)
-        (self.backup_path / 'db').mkdir(parents=True, exist_ok=True)
+        # Create folder for orphan databases (not part of any project)
+        # Repository folders will be created dynamically during gitlab backup
+        (self.backup_path / self.ORPHAN_DB_FOLDER).mkdir(parents=True, exist_ok=True)
         (self.temp_workspace).mkdir(parents=True, exist_ok=True)
 
     def backup_gitlab(self):
-        """Backup all GitLab repositories"""
+        """Backup all GitLab repositories with nested structure"""
         # Check if GitLab is configured
         if 'gitlab' not in self.config or 'group' not in self.config['gitlab']:
             self.logger.info("No GitLab configuration found, skipping...")
@@ -111,35 +115,161 @@ class DRBackupSystem:
 
         self.logger.info("Starting GitLab backup...")
 
-        git_backup_dir = self.backup_path / 'git'
+        # Get backup path overrides if configured
+        path_overrides = self.config.get('backup_path_overrides', {})
 
-        # Clean existing git backup directory to avoid conflicts
-        if git_backup_dir.exists() and any(git_backup_dir.iterdir()):
-            self.logger.info("Cleaning existing git backup directory...")
-            import shutil
-            for item in git_backup_dir.iterdir():
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
+        # Store repo info for later DB organization
+        self.repo_paths = {}  # Maps repo path to backup path
 
-        cmd = [
-            'glab', 'repo', 'clone',
-            '-g', self.config['gitlab']['group'],
-            '--include-subgroups',
-            '--per-page', str(self.config['gitlab']['per_page'])
-        ]
-
+        # Use glab CLI to get list of all projects
         env = os.environ.copy()
         env['GITLAB_TOKEN'] = self.config['gitlab']['token']
 
-        result = subprocess.run(cmd, env=env, cwd=str(git_backup_dir), capture_output=True, text=True)
+        list_cmd = [
+            'glab', 'repo', 'list',
+            '-g', self.config['gitlab']['group'],
+            '--per-page', str(self.config['gitlab']['per_page'])
+        ]
+
+        if self.config['gitlab'].get('include_subgroups', True):
+            list_cmd.append('--include-subgroups')
+
+        result = subprocess.run(list_cmd, env=env, capture_output=True, text=True)
 
         if result.returncode != 0:
-            self.logger.error(f"GitLab backup failed: {result.stderr}")
-            raise Exception("GitLab backup failed")
+            self.logger.error(f"Failed to list GitLab projects: {result.stderr}")
+            raise Exception("Failed to list GitLab projects")
+
+        # Parse project list - glab returns tabular format
+        # Skip header lines and extract project paths
+        projects = []
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+
+            # Skip header lines (contain "Project path", "Showing X of Y", etc.)
+            if 'Project path' in line or 'Showing' in line or 'Page' in line:
+                continue
+
+            # Skip separator lines (dashes)
+            if line.startswith('---') or line.startswith('==='):
+                continue
+
+            # Extract project path from tabular output (first column)
+            # Format: "group/subgroup/project    other_columns..."
+            parts = line.split()
+            if parts and '/' in parts[0]:  # Valid path contains /
+                project_path = parts[0]
+                projects.append(project_path)
+
+        self.logger.info(f"Found {len(projects)} repositories to backup")
+
+        # Clone each repository into nested structure
+        root_group = self.config['gitlab']['group']
+
+        for project_full_path in projects:
+            try:
+                # Remove root group from path to get relative path
+                if project_full_path.startswith(root_group + '/'):
+                    relative_path = project_full_path[len(root_group) + 1:]
+                else:
+                    relative_path = project_full_path
+
+                # Apply path override if configured
+                backup_path = path_overrides.get(relative_path, relative_path)
+
+                # Store mapping for DB organization later
+                self.repo_paths[relative_path] = backup_path
+
+                # Create nested directory structure with /code subfolder
+                repo_code_dir = self.backup_path / backup_path / 'code'
+                repo_code_dir.mkdir(parents=True, exist_ok=True)
+
+                # Clone the repository
+                clone_url = f"https://oauth2:{self.config['gitlab']['token']}@gitlab.com/{project_full_path}.git"
+
+                self.logger.info(f"  Cloning {relative_path} -> {backup_path}/code")
+
+                clone_cmd = ['git', 'clone', '--depth', '1', clone_url, str(repo_code_dir)]
+                clone_result = subprocess.run(clone_cmd, capture_output=True, text=True)
+
+                if clone_result.returncode != 0:
+                    self.logger.error(f"Failed to clone {project_full_path}: {clone_result.stderr}")
+                    continue
+
+            except Exception as e:
+                self.logger.error(f"Error backing up {project_full_path}: {e}")
+                continue
 
         self.logger.info("GitLab backup completed")
+
+    def organize_database_dumps(self):
+        """Organize database dumps into repository folders based on mapping"""
+        # Get the repository to DB mapping
+        repo_to_db = self.config.get('repository_to_db_mapping', {})
+
+        if not repo_to_db:
+            self.logger.info("No repository_to_db_mapping configured, skipping DB organization")
+            return
+
+        self.logger.info("Organizing database dumps into repository folders...")
+
+        db_dir = self.backup_path / self.ORPHAN_DB_FOLDER
+        if not db_dir.exists():
+            self.logger.warning("No orphan DB directory found, skipping DB organization")
+            return
+
+        # Track which DBs have been moved
+        moved_dbs = set()
+
+        # Iterate through the mapping
+        for repo_path, db_identifier in repo_to_db.items():
+            try:
+                # Parse db_identifier: "instance_id.database_name"
+                if '.' not in db_identifier:
+                    self.logger.warning(f"Invalid DB identifier format '{db_identifier}' for repo '{repo_path}'. Expected 'instance_id.database_name'")
+                    continue
+
+                instance_id, db_name = db_identifier.split('.', 1)
+
+                # Find the DB dump file in db/ directory
+                # Current naming: {instance_id}_{db_name}.sql.gz
+                source_file = db_dir / f"{instance_id}_{db_name}.sql.gz"
+
+                if not source_file.exists():
+                    self.logger.warning(f"DB dump file not found: {source_file}")
+                    continue
+
+                # Get the backup path (accounting for overrides)
+                backup_path = self.repo_paths.get(repo_path, repo_path)
+
+                # Create repo db directory
+                repo_db_dir = self.backup_path / backup_path / 'db'
+                repo_db_dir.mkdir(parents=True, exist_ok=True)
+
+                # Move DB file with simplified name (just db_name.sql.gz)
+                dest_file = repo_db_dir / f"{db_name}.sql.gz"
+
+                self.logger.info(f"  Moving {instance_id}_{db_name}.sql.gz -> {backup_path}/db/{db_name}.sql.gz")
+
+                # Move the file
+                import shutil
+                shutil.move(str(source_file), str(dest_file))
+
+                moved_dbs.add(f"{instance_id}_{db_name}.sql.gz")
+
+            except Exception as e:
+                self.logger.error(f"Error organizing DB for repo '{repo_path}': {e}")
+                continue
+
+        # Log any orphan DBs that weren't mapped
+        if db_dir.exists():
+            remaining_dbs = [f.name for f in db_dir.glob('*.sql.gz')]
+            if remaining_dbs:
+                self.logger.info(f"Orphan DBs (not mapped to repos): {', '.join(remaining_dbs)}")
+
+        self.logger.info("Database organization completed")
 
     def create_backup_user(self, engine: str, connection_params: Dict):
         """Create read-only backup user if not exists"""
@@ -197,7 +327,7 @@ class DRBackupSystem:
 
         engine = instance['engine']
         endpoint = instance['endpoint']
-        backup_file = self.backup_path / 'db' / f"{instance['id']}_{engine}.sql"
+        backup_file = self.backup_path / self.ORPHAN_DB_FOLDER / f"{instance['id']}_{engine}.sql"
 
         # Use backup user credentials
         username = self.config['databases']['backup_username']
@@ -217,7 +347,7 @@ class DRBackupSystem:
                 total_dbs = len(databases)
                 for idx, db_name in enumerate(databases, 1):
                     self.logger.info(f"  Dumping database: {db_name} [{instance['id']}: {idx}/{total_dbs}]")
-                    db_backup_file = self.backup_path / 'db' / f"{instance['id']}_{db_name}.sql"
+                    db_backup_file = self.backup_path / self.ORPHAN_DB_FOLDER / f"{instance['id']}_{db_name}.sql"
 
                     cmd = [
                         'pg_dump',
@@ -249,7 +379,7 @@ class DRBackupSystem:
                     subprocess.run(['gzip', '-9', str(db_backup_file.absolute())], check=True)
 
                 # Return the first one for compatibility
-                backup_file = self.backup_path / 'db' / f"{instance['id']}_{databases[0]}.sql.gz"
+                backup_file = self.backup_path / self.ORPHAN_DB_FOLDER / f"{instance['id']}_{databases[0]}.sql.gz"
             else:
                 # Use pg_dumpall only if 'all' is specified
                 cmd = [
@@ -310,7 +440,7 @@ class DRBackupSystem:
                 total_dbs = len(databases)
                 for idx, db_name in enumerate(databases, 1):
                     self.logger.info(f"  Dumping database: {db_name} [{instance['id']}: {idx}/{total_dbs}]")
-                    db_backup_file = self.backup_path / 'db' / f"{instance['id']}_{db_name}.sql"
+                    db_backup_file = self.backup_path / self.ORPHAN_DB_FOLDER / f"{instance['id']}_{db_name}.sql"
 
                     cmd = [
                         sys.executable, '-m', 'mssqlscripter',
@@ -344,7 +474,7 @@ class DRBackupSystem:
                     subprocess.run(['gzip', '-9', str(db_backup_file.absolute())], check=True)
 
                 # Return the first one for compatibility
-                backup_file = self.backup_path / 'db' / f"{instance['id']}_{databases[0]}.sql.gz"
+                backup_file = self.backup_path / self.ORPHAN_DB_FOLDER / f"{instance['id']}_{databases[0]}.sql.gz"
             else:
                 # Backup all databases to single file
                 cmd = [
@@ -392,7 +522,7 @@ class DRBackupSystem:
         """Backup MongoDB instance"""
         self.logger.info(f"Backing up MongoDB: {config['id']}")
 
-        backup_dir = self.backup_path / 'db' / config['id']
+        backup_dir = self.backup_path / self.ORPHAN_DB_FOLDER / config['id']
         backup_dir.mkdir(exist_ok=True)
 
         cmd = [
@@ -422,6 +552,12 @@ class DRBackupSystem:
     def archive_backup(self) -> str:
         """Create compressed archive of backup directory"""
         self.logger.info("Creating backup archive...")
+
+        # Remove orphan DB folder if it's empty
+        orphan_db_dir = self.backup_path / self.ORPHAN_DB_FOLDER
+        if orphan_db_dir.exists() and not any(orphan_db_dir.iterdir()):
+            self.logger.info(f"Removing empty {self.ORPHAN_DB_FOLDER} folder")
+            orphan_db_dir.rmdir()
 
         archive_name = f"dr-backup-{self.backup_date}.tar.gz"
         archive_path = self.temp_workspace / archive_name
@@ -536,6 +672,73 @@ class DRBackupSystem:
                 self.store_share_email(location, share_data)
             elif location['type'] == 'offline':
                 self.store_share_offline(location, share_data)
+
+    def debug_print_email_message(self, shares_temp_dir: str, checksum: str):
+        """
+        DEBUG METHOD: Print first email message without sending
+        For testing email template and backup structure generation
+        """
+        import glob
+
+        print("\n" + "="*80)
+        print("DEBUG: Email Message Preview")
+        print("="*80 + "\n")
+
+        # Store checksum
+        self.backup_checksum = checksum
+
+        # Get first email share location
+        email_locations = [loc for loc in self.config['encryption']['share_locations'] if loc['type'] == 'email']
+        if not email_locations:
+            print("ERROR: No email share locations configured!")
+            return
+
+        location = email_locations[0]
+
+        # Load first share
+        share_files = sorted(glob.glob(f"{shares_temp_dir}/share_*.json"))
+        if not share_files:
+            print("ERROR: No share files found!")
+            return
+
+        with open(share_files[0], 'r') as f:
+            share_data = json.load(f)
+
+        # Generate email using the same logic as store_share_email
+        template_path = Path(__file__).parent / 'email_template.txt'
+        with open(template_path, 'r') as f:
+            template = f.read()
+
+        backup_info = self._collect_backup_info()
+
+        storage_location = "Local: " + str(self.temp_workspace)
+        if 'storage' in self.config and 'primary' in self.config['storage']:
+            storage_location = f"{self.config['storage']['primary']['endpoint']}/{self.config['storage']['primary']['bucket']}/{self.backup_date}/dr-backup-{self.backup_date}.tar.gz.enc"
+
+        share_locations_text = ""
+        for share_loc in self.config['encryption']['share_locations']:
+            share_locations_text += "-- "
+            for key, value in share_loc.items():
+                share_locations_text += f"{key.capitalize()}: {value}. "
+            share_locations_text = share_locations_text.rstrip(". ") + "\n"
+
+        backup_structure = self._generate_backup_structure()
+
+        email_body = template.format(
+            name=location['name'],
+            backup_date=self.backup_date,
+            backup_structure=backup_structure,
+            checksum=backup_info.get('checksum', 'Pending'),
+            storage_location=storage_location,
+            total_shares=self.config['encryption']['total_shares'],
+            threshold=self.config['encryption']['threshold'],
+            share_locations=share_locations_text.rstrip('\n')
+        )
+
+        print(email_body)
+        print("\n" + "="*80)
+        print(f"Share file would be attached: share_{self.backup_date}_{share_data['share_index']}.json")
+        print("="*80 + "\n")
 
     def distribute_key_shares(self, shares: List):
         """
@@ -653,28 +856,6 @@ class DRBackupSystem:
         # Collect backup information
         backup_info = self._collect_backup_info()
 
-        # Format RDS instances
-        rds_text = ""
-        if backup_info['rds_instances']:
-            rds_text = "-- RDS Databases:\n"
-            for instance in backup_info['rds_instances']:
-                rds_text += f"   - {instance['id']}: {', '.join(instance['databases'])}\n"
-
-        # Format external databases
-        external_text = ""
-        if backup_info['external_databases']:
-            external_text = "-- External Databases:\n"
-            for db in backup_info['external_databases']:
-                db_list = ', '.join(db['databases']) if db['databases'] else 'all'
-                external_text += f"   - {db['id']} ({db['type']}): {db_list}\n"
-
-        # Format GitLab repositories
-        gitlab_text = ""
-        if backup_info['gitlab_repos']:
-            gitlab_text = "-- GitLab Repositories:\n"
-            for repo in backup_info['gitlab_repos']:
-                gitlab_text += f"   - {repo}\n"
-
         # Get storage location
         storage_location = "Local: " + str(self.temp_workspace)
         if 'storage' in self.config and 'primary' in self.config['storage']:
@@ -688,13 +869,14 @@ class DRBackupSystem:
                 share_locations_text += f"{key.capitalize()}: {value}. "
             share_locations_text = share_locations_text.rstrip(". ") + "\n"
 
+        # Generate backup structure before archiving
+        backup_structure = self._generate_backup_structure()
+
         # Fill template
         email_body = template.format(
             name=location['name'],
             backup_date=self.backup_date,
-            rds_instances=rds_text,
-            external_databases=external_text,
-            gitlab_repos=gitlab_text,
+            backup_structure=backup_structure,
             checksum=backup_info.get('checksum', 'Pending'),
             storage_location=storage_location,
             total_shares=self.config['encryption']['total_shares'],
@@ -735,6 +917,34 @@ class DRBackupSystem:
         else:
             self.logger.warning("No SMTP configuration found. Email not sent.")
             self.logger.info(f"Share file saved locally for manual sending: {share_file}")
+
+    def _generate_backup_structure(self) -> str:
+        """Generate tree structure of backup folder"""
+        def build_tree(directory, prefix=""):
+            """Recursively build directory tree"""
+            try:
+                items = sorted(directory.iterdir(), key=lambda x: (not x.is_dir(), x.name))
+            except PermissionError:
+                return ""
+
+            tree = ""
+            for i, item in enumerate(items):
+                is_last_item = (i == len(items) - 1)
+                connector = "└── " if is_last_item else "├── "
+
+                tree += f"{prefix}{connector}{item.name}/\n" if item.is_dir() else f"{prefix}{connector}{item.name}\n"
+
+                # Don't expand code/ and db/ folders
+                if item.is_dir() and item.name not in ['code', 'db']:
+                    extension = "    " if is_last_item else "│   "
+                    tree += build_tree(item, prefix + extension)
+
+            return tree
+
+        if not self.backup_path.exists():
+            return "Backup structure not available\n"
+
+        return build_tree(self.backup_path)
 
     def _collect_backup_info(self) -> Dict:
         """Collect information about what was backed up"""
@@ -983,25 +1193,29 @@ class DRBackupSystem:
             # 5. Backup external databases
             self.backup_external_databases()
 
-            # 6. Create archive
+            # 6. Organize database dumps into repository folders
+            self.organize_database_dumps()
+
+            # 7. Create archive
             archive_path = self.archive_backup()
 
-            # 7. Encrypt with Shamir's Secret Sharing (creates shares in temp location)
+            # 8. Encrypt with Shamir's Secret Sharing (creates shares in temp location)
             encryption_result = self.encrypt_with_shamir(archive_path)
 
-            # 8. Calculate checksum
+            # 9. Calculate checksum
             checksum = self.calculate_checksum(encryption_result['encrypted_file'])
 
-            # 9. Upload to write-only storage
+            # 10. Upload to write-only storage
             self.upload_to_storage(encryption_result['encrypted_file'], checksum)
 
-            # 10. Distribute key shares (ONLY after successful upload)
+            # 11. Distribute key shares (ONLY after successful upload)
             self.distribute_shares_from_temp(encryption_result['shares_temp_dir'], checksum)
+            # self.debug_print_email_message(encryption_result['shares_temp_dir'], checksum)
 
-            # 11. Clean up
+            # 12. Clean up
             self.cleanup()
 
-            # 12. Send notification
+            # 13. Send notification
             self.send_notification(True, checksum, encryption_result)
 
             self.logger.info("Backup completed successfully!")
