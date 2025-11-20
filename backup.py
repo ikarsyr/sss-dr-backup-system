@@ -191,12 +191,67 @@ class DRBackupSystem:
 
                 self.logger.info(f"  Cloning {relative_path} -> {backup_path}/code")
 
-                clone_cmd = ['git', 'clone', '--depth', '1', clone_url, str(repo_code_dir)]
-                clone_result = subprocess.run(clone_cmd, capture_output=True, text=True)
+                # Build clone command based on clone_all_branches setting
+                clone_all_branches = self.config['gitlab'].get('clone_all_branches', False)
 
-                if clone_result.returncode != 0:
-                    self.logger.error(f"Failed to clone {project_full_path}: {clone_result.stderr}")
-                    continue
+                if clone_all_branches:
+                    # Full backup: clone with complete history, all branches, and all tags
+                    clone_cmd = ['git', 'clone', clone_url, str(repo_code_dir)]
+                    clone_result = subprocess.run(clone_cmd, capture_output=True, text=True)
+
+                    if clone_result.returncode != 0:
+                        self.logger.error(f"Failed to clone {project_full_path}: {clone_result.stderr}")
+                        continue
+
+                    # Fetch all tags
+                    subprocess.run(['git', '-C', str(repo_code_dir), 'fetch', '--tags'],
+                                 capture_output=True, text=True)
+
+                    # Get list of all remote branches
+                    branch_list_cmd = ['git', '-C', str(repo_code_dir), 'branch', '-r']
+                    branch_result = subprocess.run(branch_list_cmd, capture_output=True, text=True)
+
+                    # Create local tracking branches for all remote branches
+                    for line in branch_result.stdout.strip().split('\n'):
+                        line = line.strip()
+                        # Skip HEAD pointer and empty lines
+                        if not line or 'HEAD ->' in line:
+                            continue
+
+                        # Extract branch name from "origin/branch-name" format
+                        if line.startswith('origin/'):
+                            remote_branch = line
+                            local_branch = line.replace('origin/', '')
+
+                            # Skip if it's already the current branch (master/main)
+                            # Check if branch already exists as local
+                            check_branch = subprocess.run(
+                                ['git', '-C', str(repo_code_dir), 'rev-parse', '--verify', local_branch],
+                                capture_output=True, text=True
+                            )
+                            if check_branch.returncode == 0:
+                                # Branch already exists locally, skip
+                                continue
+
+                            # Create local tracking branch
+                            checkout_cmd = ['git', '-C', str(repo_code_dir), 'checkout', '-b', local_branch, remote_branch]
+                            subprocess.run(checkout_cmd, capture_output=True, text=True)
+
+                    # Switch back to default branch (master or main)
+                    checkout_master = subprocess.run(['git', '-C', str(repo_code_dir), 'checkout', 'master'],
+                                                   capture_output=True, text=True)
+                    if checkout_master.returncode != 0:
+                        subprocess.run(['git', '-C', str(repo_code_dir), 'checkout', 'main'],
+                                     capture_output=True, text=True)
+
+                else:
+                    # Fast backup: shallow clone (only default branch, latest commit)
+                    clone_cmd = ['git', 'clone', '--depth', '1', clone_url, str(repo_code_dir)]
+                    clone_result = subprocess.run(clone_cmd, capture_output=True, text=True)
+
+                    if clone_result.returncode != 0:
+                        self.logger.error(f"Failed to clone {project_full_path}: {clone_result.stderr}")
+                        continue
 
             except Exception as e:
                 self.logger.error(f"Error backing up {project_full_path}: {e}")

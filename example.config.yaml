@@ -11,6 +11,7 @@ gitlab:
   group: yout_gitlab_group
   include_subgroups: true
   per_page: 100
+  clone_all_branches: true
 
 # Map repositories to their databases
 # Format: "relative/path/to/repo": "rds_instance_id.database_name"

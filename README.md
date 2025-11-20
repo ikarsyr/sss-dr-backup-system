@@ -39,6 +39,7 @@ gitlab:
   group: your_root_group                  # Root GitLab group ID
   token: glpat-xxx
   include_subgroups: true
+  clone_all_branches: false               # true = full clone with all branches/tags/history (slower), false = shallow clone (faster)
 
 # Map repositories to databases (optional)
 repository_to_db_mapping:
